@@ -1,0 +1,35 @@
+# Root CI/CD Pipeline (Dispatcher)
+# Detects changes and triggers child pipelines
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+
+stages:
+  - trigger
+
+# Trigger Frontend Pipeline
+trigger-frontend:
+  stage: trigger
+  rules:
+    - changes:
+        - frontend/**/*
+  trigger:
+    include: frontend/.gitlab-ci.yml
+    strategy: depend
+
+# Trigger Backend Pipeline
+trigger-backend:
+  stage: trigger
+  rules:
+    - changes:
+        - backend/**/*
+        # If your BE code is in api/, use:
+        # - api/**/*
+  trigger:
+    include: backend/.gitlab-ci.yml
+    strategy: depend

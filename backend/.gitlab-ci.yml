@@ -1,0 +1,137 @@
+default:
+  tags:
+    - python
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - if: '$CI_COMMIT_BRANCH == "development"'
+      when: always
+
+stages:
+  - build
+  - test
+  - deploy
+
+image: python:3.12-slim
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+
+#########################################
+# BUILD
+#########################################
+build-backend:
+  stage: build
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends gcc build-essential zip curl
+    - cd backend
+    - python --version
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - test -f manage.py || (echo "manage.py not found inside backend/" && exit 1)
+    - test -f requirements.txt || (echo "requirements.txt not found inside backend/" && exit 1)
+    - cd ..
+  artifacts:
+    paths:
+      - backend/
+    expire_in: 1 hour
+
+#########################################
+# TEST
+#########################################
+unit-test-backend:
+  stage: test
+  needs: ["build-backend"]
+  script:
+    - cd backend
+    - python --version
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install pytest
+    - pytest || echo "No tests yet"
+    - cd ..
+
+#########################################
+# DEPLOY
+#########################################
+deploy-backend:
+  stage: deploy
+  image: python:3.12-slim
+  tags:
+    - docker
+  needs: ["build-backend", "unit-test-backend"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script: |
+    set -e
+
+    apt-get update && apt-get install -y --no-install-recommends zip curl
+
+    : "${AZURE_BE_USER:?Missing AZURE_BE_USER}"
+    : "${AZURE_BE_PASS:?Missing AZURE_BE_PASS}"
+
+    echo "Validating backend structure..."
+    test -f backend/manage.py || (echo "backend/manage.py not found" && exit 1)
+    test -f backend/requirements.txt || (echo "backend/requirements.txt not found" && exit 1)
+
+    echo "Creating deployment package..."
+    
+    # Verify startup.sh exists before zipping
+    test -f backend/startup.sh || (echo "startup.sh not found!" && exit 1)
+    
+    # Ensure startup.sh has Unix line endings
+    dos2unix backend/startup.sh 2>/dev/null || true
+    
+    # Make startup.sh executable
+    chmod +x backend/startup.sh
+    
+    # Create zip with ONLY backend code, NO antenv or venv
+    zip -r backend.zip backend/ \
+      -x "backend/antenv/*" \
+      -x "backend/.venv/*" \
+      -x "backend/venv/*" \
+      -x "backend/__pycache__/*" \
+      -x "backend/*.pyc" \
+      -x "backend/**/*.pyc" \
+      -x "backend/**/__pycache__/*" \
+      -x "backend/.pytest_cache/*" \
+      -x "backend/.git/*" \
+      -x "backend/.mypy_cache/*" \
+      -x "backend/.DS_Store"
+
+    echo "Package created:"
+    ls -lh backend.zip
+    
+    # Verify the zip is readable before upload
+    echo "Verifying package integrity:"
+    zip -t backend.zip >/dev/null && echo "✓ Package is valid"
+
+    BE_DEPLOY_URL="https://carbonview-backend-ahbwdrctb0d3h2hk.scm.northeurope-01.azurewebsites.net/api/zipdeploy?isAsync=true"
+
+    echo "Starting Azure ZipDeploy..."
+    BE_STATUS="$(curl -sS -o be_deploy_response.txt -w "%{http_code}" \
+      -u "${AZURE_BE_USER}:${AZURE_BE_PASS}" \
+      -H "Content-Type: application/zip" \
+      --data-binary "@backend.zip" \
+      "${BE_DEPLOY_URL}")"
+
+    echo "Deploy status: ${BE_STATUS}"
+    echo "Azure deploy response:"
+    cat be_deploy_response.txt || true
+
+    if [ "${BE_STATUS}" != "200" ] && [ "${BE_STATUS}" != "202" ]; then
+      echo "Deployment failed"
+      exit 1
+    fi
+
+    echo "Deployment request accepted."

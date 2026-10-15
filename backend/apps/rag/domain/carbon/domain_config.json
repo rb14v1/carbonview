@@ -1,0 +1,30 @@
+{
+  "name": "carbon",
+  "document_builder": "apps.rag.domain.carbon.document_builders.CarbonDocumentBuilder",
+  "sql_handlers": [
+    "apps.rag.domain.carbon.sql_handlers.CreditsHandler",
+    "apps.rag.domain.carbon.sql_handlers.EnergyHandler",
+    "apps.rag.domain.carbon.sql_handlers.WaterHandler",
+    "apps.rag.domain.carbon.sql_handlers.WasteHandler",
+    "apps.rag.domain.carbon.sql_handlers.EmissionsHandler"
+  ],
+  "filter_mapping": {
+    "entities": {
+      "organization": "organization_id",
+      "facility": "facility_id",
+      "reporting_period": "reporting_period_id"
+    },
+    "dimensions": {
+      "scopes": "scope"
+    },
+    "time_range": {
+      "years": "year",
+      "month_year_pairs": "year_month"
+    }
+  },
+  "labels": {
+    "organization": "organization",
+    "facility": "facility",
+    "reporting_period": "reporting period"
+  }
+}
