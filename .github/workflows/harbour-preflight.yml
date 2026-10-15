@@ -1,0 +1,109 @@
+name: Harbour Preflight
+
+on:
+  push:
+    branches: ["harbour/preflight"]
+
+# A repair pushes more than one commit; only the last one matters.
+concurrency:
+  group: harbour-preflight
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint the build workflow
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color -shellcheck= -pyflakes= .github/workflows/harbour-build.yml
+
+  verify:
+    name: verify (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "backend"
+            file: "backend/Dockerfile"
+            context: "backend"
+            port: 8080
+            health: "/healthz"
+            env: "DJANGO_SECRET_KEY=harbour-preflight-itjf3iw6t70gf00h753jf7 DJANGO_ALLOWED_HOSTS=.azurecontainerapps.io,localhost,127.0.0.1"
+            db: "postgres"
+            kind: "service"
+          - name: "frontend"
+            file: "frontend/Dockerfile"
+            context: "frontend"
+            port: 8080
+            health: "/healthz"
+            env: ""
+            db: ""
+            kind: "service"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -f "${{ matrix.file }}" -t harbour-preflight "${{ matrix.context }}"
+      - name: Run it and check it serves
+        env:
+          PORT: ${{ matrix.port }}
+          HEALTH: ${{ matrix.health }}
+          APP_ENV: ${{ matrix.env }}
+          DB: ${{ matrix.db }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          if [ "$KIND" = "job" ]; then
+            envs=()
+            for kv in $APP_ENV; do envs+=(-e "$kv"); done
+            docker run -d --name app --memory=1g --cpus=0.5 "${envs[@]}" harbour-preflight
+            wait_s="${JOB_WAIT_SECONDS:-30}"
+            for i in $(seq 1 "$wait_s"); do
+              if [ -z "$(docker ps -q -f name=app)" ]; then
+                code=$(docker inspect -f '{{.State.ExitCode}}' app)
+                docker logs app
+                [ "$code" = "0" ] && { echo "job exited 0"; exit 0; }
+                echo "::error::job exited with code $code before finishing (see the log above)"
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "job still running after ${wait_s}s, so it started cleanly"
+            exit 0
+          fi
+          envs=()
+          net=()
+          for kv in $APP_ENV; do envs+=(-e "$kv"); done
+          case "$DB" in
+            postgres) db_image=postgres:16-alpine; db_env="-e POSTGRES_PASSWORD=preflight -e POSTGRES_DB=app"; db_ready='pg_isready -U postgres'; db_url=postgres://postgres:preflight@db:5432/app ;;
+            mysql) db_image=mysql:8; db_env="-e MYSQL_ROOT_PASSWORD=preflight -e MYSQL_DATABASE=app"; db_ready='mysqladmin ping -h 127.0.0.1 -uroot -ppreflight --silent'; db_url=mysql://root:preflight@db:3306/app ;;
+          esac
+          if [ -n "$DB" ]; then
+            docker network create harbour-pf
+            docker run -d --name db --network harbour-pf $db_env "$db_image"
+            for i in $(seq 1 60); do docker exec db sh -c "$db_ready" && break; sleep 1; done
+            envs+=(-e "DATABASE_URL=$db_url")
+            net=(--network harbour-pf)
+          fi
+          docker run -d --name app "${net[@]}" --memory=1g --cpus=0.5 -p 8080:"$PORT" -e PORT="$PORT" -e HOSTNAME=0.0.0.0 "${envs[@]}" harbour-preflight
+          body="${TMPDIR:-/tmp}/harbour-preflight-body"
+          alive() { [ -n "$(docker ps -q -f name=app)" ]; }
+          fail() { echo "::error::$1"; [ -s "$body" ] && head -c 500 "$body" && echo; docker logs app; exit 1; }
+          status=000
+          wait_s="${WAIT_SECONDS:-60}"
+          for i in $(seq 1 "$wait_s"); do
+            alive || fail "container exited before it answered on port $PORT"
+            status=$(curl -s -o "$body" -w '%{http_code}' --max-time 3 -H "Host: harbour-preflight.azurecontainerapps.io" "http://127.0.0.1:8080$HEALTH" || true)
+            [ "$status" != "000" ] && break
+            sleep 1
+          done
+          [ "$status" = "000" ] && fail "nothing answered HTTP on port $PORT within ${wait_s}s"
+          echo "$HEALTH answered $status"
+          case "$status" in
+            2*|3*|404|405) ;;
+            *) fail "$HEALTH answered $status for Host: harbour-preflight.azurecontainerapps.io, which DEPLOY's health check rejects" ;;
+          esac
+          sleep 5
+          alive || fail "container exited after it answered (crash after boot)"
